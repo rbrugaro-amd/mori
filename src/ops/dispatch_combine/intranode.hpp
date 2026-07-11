@@ -39,6 +39,10 @@ namespace moe {
 
 #define MAX_GPUS_PER_NODE 8
 
+// Split dispatch/combine: when set, IntraNode dispatch feeds an AsyncLL combine -> write recv
+// tokens to interNodeTokBufs.dispatchOut and leave recvTokenNum set (AsyncLL combine consumes it).
+extern "C" { __device__ int g_epMixedIntraDispatch = 0; }
+
 /* ---------------------------------------------------------------------------------------------- */
 /*                                          BarrierKernel                                         */
 /* ---------------------------------------------------------------------------------------------- */
@@ -121,7 +125,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       // via the same overflow sentinel the dedup path uses; the whole warp
       // skips coherently.
       if ((destPe < 0) || (destPe >= config.worldSize)) {
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        if (laneId == 0) args.dispDestTokIdMap[i] = g_epMixedIntraDispatch ? NullSendBufSlotOffset(config) : FlatTokenIndex(config, config.worldSize, 0);
         continue;
       }
 
@@ -135,7 +139,7 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       if (__any(condition)) {
         // Indicate that this token is already sent to the destination PE by setting an overflow
         // token index
-        if (laneId == 0) args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+        if (laneId == 0) args.dispDestTokIdMap[i] = g_epMixedIntraDispatch ? NullSendBufSlotOffset(config) : FlatTokenIndex(config, config.worldSize, 0);
         continue;
       }
 
@@ -144,13 +148,18 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
         destTokId = atomicAdd(args.dispTokOffsetMemObj->template GetAs<index_t*>(destPe), 1);
         assert(destTokId < config.MaxNumTokensToRecv() &&
                "Total recv token overflow: increase maxTotalRecvTokens");
-        atomicAdd(args.destPeTokenCounter + destPe, 1);
-        // In dispDestTokIdMap, record the destination slot for this token-expert pair (flat index
-        // into the dest PE's recv buffer) In dispTokIdToSrcTokIdMemObj on the dest PE, record which
-        // global source token occupies this slot (for combine-phase routing)
-        args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
-        args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
-            FlatTokenIndex(config, myPe, srcTokId);
+        index_t _blockPos = atomicAdd(args.destPeTokenCounter + destPe, 1);
+        // Split mode: encode both maps in SendBufSlotOffset(pe, blockPos) so the AsyncLL combine
+        // (SendCopy reads dispTokIdToSrcTokId; RecvCopy reads dispDestTokIdMap) routes correctly.
+        if (g_epMixedIntraDispatch) {
+          args.dispDestTokIdMap[i] = SendBufSlotOffset(config, destPe, _blockPos);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              SendBufSlotOffset(config, myPe, _blockPos);
+        } else {
+          args.dispDestTokIdMap[i] = FlatTokenIndex(config, destPe, destTokId);
+          args.dispTokIdToSrcTokIdMemObj->template GetAs<index_t*>(destPe)[destTokId] =
+              FlatTokenIndex(config, myPe, srcTokId);
+        }
       }
       destTokId = __shfl(destTokId, 0);
 
@@ -178,7 +187,9 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
       size_t srcTokOffset = srcTokId * hiddenDim;
       size_t destTokOffset = destTokId * hiddenDim;
 
-      core::WarpCopy(args.intraNodeTokBufs.dispatchOut->template GetAs<T*>(destPe) + destTokOffset,
+      core::WarpCopy((g_epMixedIntraDispatch ? args.interNodeTokBufs.dispatchOut
+                                             : args.intraNodeTokBufs.dispatchOut)
+                         ->template GetAs<T*>(destPe) + destTokOffset,
                      args.inpTokenBuf + srcTokOffset, hiddenDim);
     }
   }
@@ -206,10 +217,15 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
+    // Split mode: reset the recv accumulator each dispatch (AsyncLL resets it in
+    // SendCopySlotAssign, which mixed mode skips; else it accumulates across decode steps
+    // -> totalRecvTokenNum grows unbounded -> moe_sorting OOB write / GPU fault).
+    if (g_epMixedIntraDispatch && laneId == 0) *args.totalRecvTokenNum = 0;
+    __syncwarp();
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
+      if (!g_epMixedIntraDispatch) core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 
       // reset local counter
@@ -219,6 +235,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
     // reset counter
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+      // Split mode: bump the cross-device barrier flag once per dispatch (AsyncLL dispatch does
+      // this in RecvCopy, which mixed mode does not run) so the AsyncLL combine barrier uses a
+      // FRESH value each iteration and its WaitUntilEquals never passes on stale memobj values.
+      if (g_epMixedIntraDispatch) atomicAdd(args.crossDeviceBarrierFlag, (unsigned long long)1);
     }
   }
 
@@ -304,7 +324,7 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
       if (__any(condition)) {
         // All 4 warps skip together, only warp 0 writes the skip marker
         if (inGroupWarpId == 0 && laneId == 0) {
-          args.dispDestTokIdMap[i] = FlatTokenIndex(config, config.worldSize, 0);
+          args.dispDestTokIdMap[i] = g_epMixedIntraDispatch ? NullSendBufSlotOffset(config) : FlatTokenIndex(config, config.worldSize, 0);
         }
         continue;
       }
@@ -412,10 +432,15 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
   MORI_TRACE_NEXT(seq, Slot::DispatchWaitPeerToken);
   index_t* recvTokenNums = args.recvTokenNumMemObj->template GetAs<index_t*>();
   if (globalWarpId == 0) {
+    // Split mode: reset the recv accumulator each dispatch (AsyncLL resets it in
+    // SendCopySlotAssign, which mixed mode skips; else it accumulates across decode steps
+    // -> totalRecvTokenNum grows unbounded -> moe_sorting OOB write / GPU fault).
+    if (g_epMixedIntraDispatch && laneId == 0) *args.totalRecvTokenNum = 0;
+    __syncwarp();
     for (int destPe = laneId; destPe < npes; destPe += warpSize) {
       index_t* signal = recvTokenNums + destPe;
       index_t recvTokenNum = shmem::ShmemInt32WaitUntilGreaterThan(signal, 0) - 1;
-      core::AtomicStoreRelaxedSystem(signal, 0);
+      if (!g_epMixedIntraDispatch) core::AtomicStoreRelaxedSystem(signal, 0);
       atomicAdd(args.totalRecvTokenNum, recvTokenNum);
 
       // reset local counter
@@ -425,6 +450,10 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
     // reset counter
     if (laneId == 0) {
       args.dispTokOffsetMemObj->template GetAs<index_t*>()[0] = 0;
+      // Split mode: bump the cross-device barrier flag once per dispatch (AsyncLL dispatch does
+      // this in RecvCopy, which mixed mode does not run) so the AsyncLL combine barrier uses a
+      // FRESH value each iteration and its WaitUntilEquals never passes on stale memobj values.
+      if (g_epMixedIntraDispatch) atomicAdd(args.crossDeviceBarrierFlag, (unsigned long long)1);
     }
   }
 
@@ -445,7 +474,7 @@ __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
 /* ---------------------------------------------------------------------------------------------- */
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8>
 __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   using TokT =
       std::conditional_t<UseFp8DirectCast || UseFp8BlockwiseQuant, core::CombineInternalFp8, T>;
@@ -709,18 +738,18 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
       if constexpr (Vec8Top8BlockElems != 0) {
         if (mwIter.warpsPerItem == 1) {
           core::WarpAccumFp8DequantFullBlockVec8Top8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+                                                     Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDim);
         } else if ((hiddenDimOffset & 0x7) == 0 && (hiddenDimSize & 0x7) == 0) {
           core::WarpAccumFp8DequantSegmentBlockVec8Top8<T, core::CombineInternalFp8,
-                                                        Vec8Top8BlockElems>(
+                                                        Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         } else {
           // Misaligned segment: vec8 helper would fault on the load. Tiny scalar fallback.
           core::WarpAccumFp8DequantSegmentScalarTop8<T, core::CombineInternalFp8,
-                                                     Vec8Top8BlockElems>(
+                                                     Vec8Top8BlockElems, Vec8AccumNum>(
               outPtr, reinterpret_cast<const core::CombineInternalFp8* const*>(srcPtrs),
               reinterpret_cast<const float* const*>(srcScalePtrs), hiddenDimOffset, hiddenDimSize);
         }
@@ -761,10 +790,10 @@ __device__ __forceinline__ void EpCombineIntraNodeKernel_body(EpDispatchCombineA
 
 template <typename T, bool UseP2PRead = true, bool EnableStdMoE = false,
           bool UseFp8DirectCast = false, bool UseFp8BlockwiseQuant = false, bool UseWeights = true,
-          int Vec8Top8BlockElems = 0>
+          int Vec8Top8BlockElems = 0, int Vec8AccumNum = 8>
 __global__ void EpCombineIntraNodeKernel(EpDispatchCombineArgs<T> args) {
   EpCombineIntraNodeKernel_body<T, UseP2PRead, EnableStdMoE, UseFp8DirectCast, UseFp8BlockwiseQuant,
-                                UseWeights, Vec8Top8BlockElems>(args);
+                                UseWeights, Vec8Top8BlockElems, Vec8AccumNum>(args);
 }
 
 }  // namespace moe

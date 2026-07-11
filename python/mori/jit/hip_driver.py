@@ -81,6 +81,52 @@ class HipModule:
             self._functions[name] = HipFunction(func, name)
         return self._functions[name]
 
+
+    def set_global_ptr(self, name: str, value: int) -> None:
+        """Set a __device__ pointer global (declared extern "C") to `value`, a device address.
+
+        Used for Tier-2 combine/compute overlap: point the combine kernel's completion-signal
+        globals at the caller-owned device buffers. hipModuleGetGlobal resolves the unmangled
+        symbol; the 8-byte device address is copied into the global pointer variable.
+        """
+        hip = _get_hip_lib()
+        dptr = c_void_p()
+        nbytes = ctypes.c_size_t()
+        err = hip.hipModuleGetGlobal(
+            byref(dptr), byref(nbytes), self._module, c_char_p(name.encode())
+        )
+        _check(err, f"hipModuleGetGlobal({name})")
+        val = ctypes.c_uint64(value)
+        err = hip.hipMemcpyHtoD(dptr, byref(val), ctypes.c_size_t(8))
+        _check(err, f"hipMemcpyHtoD({name})")
+
+    def set_global_i32(self, name: str, value: int) -> None:
+        """Set a 4-byte __device__ int global (extern "C") to `value`. Used for the Tier-2
+        block-granularity scalars g_tier2BlockMaxSlot / g_tier2BlockNCol."""
+        hip = _get_hip_lib()
+        dptr = c_void_p()
+        nbytes = ctypes.c_size_t()
+        err = hip.hipModuleGetGlobal(
+            byref(dptr), byref(nbytes), self._module, c_char_p(name.encode())
+        )
+        _check(err, f"hipModuleGetGlobal({name})")
+        val = ctypes.c_int32(value)
+        err = hip.hipMemcpyHtoD(dptr, byref(val), ctypes.c_size_t(4))
+        _check(err, f"hipMemcpyHtoD({name})")
+
+    def get_global_ptr(self, name: str) -> int:
+        hip = _get_hip_lib()
+        dptr = c_void_p()
+        nbytes = ctypes.c_size_t()
+        err = hip.hipModuleGetGlobal(
+            byref(dptr), byref(nbytes), self._module, c_char_p(name.encode())
+        )
+        _check(err, f"hipModuleGetGlobal({name})")
+        val = ctypes.c_uint64(0)
+        err = hip.hipMemcpyDtoH(byref(val), dptr, ctypes.c_size_t(8))
+        _check(err, f"hipMemcpyDtoH({name})")
+        return int(val.value)
+
     def __del__(self):
         if self._module and _hip is not None:
             try:

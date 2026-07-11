@@ -229,6 +229,7 @@ class EpDispatchCombineOp:
 
         self._handle = handle_class(self._cpp_config)
         self._hip_module = _load_hip_modules(config.kernel_type)
+        self._mixed_dispatch_module = None  # split dispatch/combine: IntraNode dispatch module
         self._handle_info = mori_cpp.get_handle_info(self._handle)
 
         self._fp8_blockwise_combine_scale_dim = self._handle_info[
@@ -429,6 +430,46 @@ class EpDispatchCombineOp:
         launch_multi(funcs, grids, blocks, shared_mems, stream, args_ptr)
 
     # ------------------------------------------------------------------
+    # Tier-2 combine/compute overlap: per-token completion signal
+    # ------------------------------------------------------------------
+    def enable_mixed_dispatch(self) -> None:
+        """Split dispatch/combine: run the fast fused IntraNode dispatch, then the AsyncLL
+        (overlappable) combine, on THIS (AsyncLL-created) handle. Loads the ep_intranode module and
+        sets the extern-C mode globals in both modules. Requires kernel_type == AsyncLL."""
+        assert self.config.kernel_type == EpDispatchCombineKernelType.AsyncLL, (
+            "enable_mixed_dispatch requires an AsyncLL handle (allocates combine buffers)")
+        _ensure_jit_kernels(EpDispatchCombineKernelType.IntraNode)
+        self._mixed_dispatch_module = _load_hip_modules(EpDispatchCombineKernelType.IntraNode)
+        self._mixed_dispatch_module.set_global_i32("g_epMixedIntraDispatch", 1)
+        self._hip_module.set_global_i32("g_epMixedCombine", 1)
+        # Opt-in: fuse SendTransfer into SendCopy so the async put fires DURING moe2
+        # (hides the all-to-all transfer latency). Off by default.
+        if os.environ.get("SGLANG_MORI_FUSED_SEND_TRANSFER", "0") == "1":
+            self._hip_module.set_global_i32("g_epFusedSendTransfer", 1)
+
+    def set_tier2_combine_signal(self, signal_ptr: int, expected_ptr: int) -> None:
+        """Point the AsyncLL combine send-copy completion-signal __device__ globals at
+        caller-owned int32 device buffers (indexed by recv-token id). The producer is the
+        aiter stage-2 down-GEMM epilogue; expected[t] = local_slots[t] * n_col_tiles."""
+        self._hip_module.set_global_ptr("g_tier2CombineCompSignal", signal_ptr)
+        self._hip_module.set_global_ptr("g_tier2CombineCompExpected", expected_ptr)
+
+    def set_tier2_block_signal(self, sig_mtile_ptr: int, token_mtiles_ptr: int,
+                               max_slot: int, n_col_tiles: int) -> None:
+        """Block-granularity variant: g_tier2CombineCompSignal is a PER-M-TILE counter, and the
+        send-copy waits on each m-tile in token_mtiles[tokenId*max_slot + k] (>=0) until it reaches
+        n_col_tiles. ~tile_m x fewer producer atomics than the per-token path."""
+        self._hip_module.set_global_ptr("g_tier2CombineCompSignal", sig_mtile_ptr)
+        self._hip_module.set_global_ptr("g_tier2BlockTokenMtiles", token_mtiles_ptr)
+        self._hip_module.set_global_i32("g_tier2BlockMaxSlot", int(max_slot))
+        self._hip_module.set_global_i32("g_tier2BlockNCol", int(n_col_tiles))
+
+    def clear_tier2_combine_signal(self) -> None:
+        """Disable the per-token wait (restore default combine behavior)."""
+        self._hip_module.set_global_ptr("g_tier2CombineCompSignal", 0)
+        self._hip_module.set_global_ptr("g_tier2BlockTokenMtiles", 0)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def get_launch_config(
@@ -530,7 +571,12 @@ class EpDispatchCombineOp:
         shared_mem = self._dispatch_shared_mem(actual_wpb)
         kt = self.config.kernel_type.value
 
-        if kt == EpDispatchCombineKernelType.InterNode.value:
+        if self._mixed_dispatch_module is not None:
+            # Split mode: fast fused IntraNode dispatch launched from the ep_intranode module
+            # (writes interNodeTokBufs.dispatchOut + leaves recvTokenNum for the AsyncLL combine).
+            func = self._mixed_dispatch_module.get_function(f"EpDispatchIntraNodeKernel_{sfx}")
+            func.launch_struct(grid, block, shared_mem, stream, args_ptr)
+        elif kt == EpDispatchCombineKernelType.InterNode.value:
             self._launch(
                 f"EpDispatchInterNodeKernel_{sfx}",
                 grid,
@@ -671,7 +717,12 @@ class EpDispatchCombineOp:
         # Recv kernels must reuse the handle's inference pointers/state prepared by the
         # preceding dispatch_send/dispatch call, so only rebuild raw args here.
         args_ptr = mori_cpp.build_args(self._handle, rdma_block_num=0)
-        if kt == EpDispatchCombineKernelType.AsyncLL.value:
+        if self._mixed_dispatch_module is not None:
+            # Split mode: the IntraNode dispatch (run via dispatch_send -> dispatch) is a single
+            # kernel that already did send+recv+convert. Running the AsyncLL recv kernels here would
+            # corrupt that state, so recv is a no-op (only local_expert_count below still runs).
+            pass
+        elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
             mb_block = WARP_SIZE * 16
@@ -766,9 +817,10 @@ class EpDispatchCombineOp:
             if kt not in (
                 EpDispatchCombineKernelType.IntraNode.value,
                 EpDispatchCombineKernelType.IntraNodeLL.value,
+                EpDispatchCombineKernelType.AsyncLL.value,
             ):
                 raise ValueError(
-                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL combine"
+                    "Fp8BlockwiseQuant currently only supports IntraNode/IntraNodeLL/AsyncLL combine"
                 )
             if sfx != "bf16":
                 raise ValueError(f"Fp8BlockwiseQuant only supports bf16, got {sfx}")
@@ -828,28 +880,39 @@ class EpDispatchCombineOp:
             EpDispatchCombineKernelType.IntraNodeLL.value,
         ):
             if quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
-                # Mirror of the AccumNum=8 + VecBytes=8 specialization gating in
-                # LaunchCombine() / launch.cpp. Keep in sync.
+                # Mirror of the AccumNum=8/9 + VecBytes=8 specialization gating in
+                # LaunchCombine() / launch.cpp. top-k==9 covers shared-expert fusion
+                # (8 routed + 1 fused shared). Keep in sync.
                 fp8_scale_dim = self._fp8_blockwise_combine_scale_dim
                 block_elems = (hidden_dim + fp8_scale_dim - 1) // fp8_scale_dim
                 base_vec8_top8_eligible = (
                     weight_ptr == 0
                     and (hidden_dim % 512) == 0
-                    and self.config.num_experts_per_token == 8
+                    and self.config.num_experts_per_token in (8, 9)
                     and self.config.world_size > 4
                 )
+                top9 = self.config.num_experts_per_token == 9
                 kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq"
                 use_vec8_top8 = False
                 if base_vec8_top8_eligible:
                     if block_elems == 128:
-                        kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8"
+                        kernel_name = (
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8_top9"
+                            if top9
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block128_vec8"
+                        )
                         use_vec8_top8 = True
                     elif block_elems == 256:
-                        kernel_name = "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
+                        kernel_name = (
+                            "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8_top9"
+                            if top9
+                            else "EpCombineIntraNodeKernel_bf16_nop2p_fp8bwq_noweight_block256_vec8"
+                        )
                         use_vec8_top8 = True
                 shared_mem = self._combine_shared_mem(
                     actual_wpb, use_weights=not use_vec8_top8
                 )
+                self._last_combine_kernel_name = kernel_name
                 self._launch(
                     kernel_name,
                     grid,
@@ -892,13 +955,33 @@ class EpDispatchCombineOp:
         elif kt == EpDispatchCombineKernelType.AsyncLL.value:
             mp = self._handle_info["multi_processor_count"]
             mp_aligned = mp // self.config.world_size * self.config.world_size
+            # Tier-2 overlap: cap the SendCopy grid so the (spin-waiting) combine does not
+            # steal CUs from the concurrent stage-2 down-GEMM. 0/unset => full grid (default).
+            _t2sms = int(os.environ.get("SGLANG_TIER2_COMBINE_SMS", "0"))
+            if _t2sms > 0:
+                _ws = self.config.world_size
+                send_grid = max(_ws, min(mp_aligned, _t2sms // _ws * _ws))
+            else:
+                send_grid = mp_aligned
             if sfx == "bf16" and quant_type == EpDispatchCombineQuantType.Fp8DirectCast:
                 self._launch_multi(
                     [
                         "EpCombineLowLatencyAsyncSendCopy_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8cast",
                     ],
-                    [mp_aligned, self.config.world_size],
+                    [send_grid, self.config.world_size],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, 0],
+                    stream,
+                    args_ptr,
+                )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncSendCopy_bf16_fp8bwq",
+                        "EpCombineLowLatencyAsyncSendTransfer_bf16_fp8bwq",
+                    ],
+                    [send_grid, self.config.world_size],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, 0],
                     stream,
@@ -910,7 +993,7 @@ class EpDispatchCombineOp:
                         f"EpCombineLowLatencyAsyncSendCopy_{sfx}",
                         f"EpCombineLowLatencyAsyncSendTransfer_{sfx}",
                     ],
-                    [mp_aligned, self.config.world_size],
+                    [send_grid, self.config.world_size],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
                     [0, 0],
                     stream,
@@ -985,6 +1068,18 @@ class EpDispatchCombineOp:
                     [
                         "EpCombineLowLatencyAsyncRecvTransfer_bf16_fp8cast",
                         "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8cast",
+                    ],
+                    [self.config.world_size, mp_aligned],
+                    [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
+                    [0, shared_mem],
+                    stream,
+                    args_ptr,
+                )
+            elif quant_type == EpDispatchCombineQuantType.Fp8BlockwiseQuant:
+                self._launch_multi(
+                    [
+                        "EpCombineLowLatencyAsyncRecvTransfer_bf16",
+                        "EpCombineLowLatencyAsyncRecvCopy_bf16_fp8bwq",
                     ],
                     [self.config.world_size, mp_aligned],
                     [WARP_SIZE * actual_wpb, WARP_SIZE * actual_wpb],
