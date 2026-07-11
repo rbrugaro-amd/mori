@@ -152,8 +152,17 @@ void Context::InitializePossibleTransports() {
   }
   assert(rankInNode < 8);
 
-  // Init rdma context
-  rdmaContext.reset(new RdmaContext(RdmaBackendType::DirectVerbs));
+  // Init rdma context. Backend selectable via MORI_RDMA_BACKEND=ibverbs (default DirectVerbs).
+  // IBVerbs uses stock libibverbs verbs (works where the vendor direct-verbs API is unavailable,
+  // e.g. Broadcom bnxt DV missing in-container); DirectVerbs remains the default for perf.
+  RdmaBackendType rdmaBackend = RdmaBackendType::DirectVerbs;
+  {
+    const char* envBackend = std::getenv("MORI_RDMA_BACKEND");
+    if (envBackend != nullptr && std::string(envBackend) == "ibverbs") {
+      rdmaBackend = RdmaBackendType::IBVerbs;
+    }
+  }
+  rdmaContext.reset(new RdmaContext(rdmaBackend));
   const RdmaDeviceList& devices = rdmaContext->GetRdmaDeviceList();
   ActiveDevicePortList activeDevicePortList = GetActiveDevicePortList(devices);
 
