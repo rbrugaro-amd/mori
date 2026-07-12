@@ -453,6 +453,7 @@ class EpDispatchCombineOp:
         aiter stage-2 down-GEMM epilogue; expected[t] = local_slots[t] * n_col_tiles."""
         self._hip_module.set_global_ptr("g_tier2CombineCompSignal", signal_ptr)
         self._hip_module.set_global_ptr("g_tier2CombineCompExpected", expected_ptr)
+        self._maybe_enable_fused_send_transfer()
 
     def set_tier2_block_signal(self, sig_mtile_ptr: int, token_mtiles_ptr: int,
                                max_slot: int, n_col_tiles: int) -> None:
@@ -463,6 +464,14 @@ class EpDispatchCombineOp:
         self._hip_module.set_global_ptr("g_tier2BlockTokenMtiles", token_mtiles_ptr)
         self._hip_module.set_global_i32("g_tier2BlockMaxSlot", int(max_slot))
         self._hip_module.set_global_i32("g_tier2BlockNCol", int(n_col_tiles))
+        self._maybe_enable_fused_send_transfer()
+
+    def _maybe_enable_fused_send_transfer(self) -> None:
+        """Multi-node transfer hiding: fire cross-node RDMA puts DURING moe2 (pure AsyncLL, not just
+        the mixed/split path). Opt-in via SGLANG_MORI_FUSED_SEND_TRANSFER=1; inert single-node
+        (no cross-node dests). Called from the Tier-2 setup so it engages whenever overlap is on."""
+        if os.environ.get("SGLANG_MORI_FUSED_SEND_TRANSFER", "0") == "1":
+            self._hip_module.set_global_i32("g_epFusedSendTransfer", 1)
 
     def clear_tier2_combine_signal(self) -> None:
         """Disable the per-token wait (restore default combine behavior)."""

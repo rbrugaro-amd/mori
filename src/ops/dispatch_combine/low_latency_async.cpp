@@ -541,8 +541,10 @@ __device__ void EpCombineLowLatencyAsyncSendCopy_body(EpDispatchCombineArgs<T> a
     // ---- Early-firing fused transfer (hybrid): CROSS-NODE dests -> post this token's RDMA put NOW
     // (spread across moe2 so the transfer overlaps compute). Intra-node dests stay batched in
     // SendTransfer (SDMA's serialized ring can't take the per-token rate). Single-node = no cross-node
-    // dests -> inert. Mixed path only (stagingTokId encodes SendBufSlotOffset).
-    if (::g_epFusedSendTransfer && ::g_epMixedCombine) {
+    // dests -> inert. Works for BOTH pure-AsyncLL and mixed: stagingTokId encodes SendBufSlotOffset
+    // in both paths (pure AsyncLL: dispReceiverIdxMap[t]=SendBufSlotOffset(destPe,slot) @ dispatch;
+    // mixed: dispTokIdToSrcTokIdMemObj). This is the multi-node lever (was mixed-gated, single-node only).
+    if (::g_epFusedSendTransfer) {
       const int _destPe = PeFromSendBufSlotOffset(config, stagingTokId);
       if (_destPe < npes && _destPe != myPe && (_destPe / config.gpuPerNode) != myNode) {
         const int _blockPos = SlotIdFromSendBufSlotOffset(config, stagingTokId);
